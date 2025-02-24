@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - static_volume:/app/static
+      - media_volume:/app/media
+    environment:
+      - APP_ENV=production
+      - MONGODB_URI=mongodb+srv://avatarme05:Cp7hXiS6KXCUSHfl@deepchat.p7weg.mongodb.net/?retryWrites=true&w=majority&appName=Deepchat
+      - POETRY_VIRTUALENVS_IN_PROJECT=true  # Указываем переменную окружения
+    restart: always
+    command: ["poetry", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+
+  nginx:
+    build: ./nginx
+    ports:
+      - "80:80"
+    volumes:
+      - static_volume:/app/static
+      - media_volume:/app/media
+    depends_on:
+      - web
+
+volumes:
+  static_volume:
+  media_volume:

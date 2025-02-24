@@ -1,16 +1,24 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from config import collections, db
-from database.models import UserProfile, TokenResponse, Subscription, Purchases, Presentations
+from database.models import UserProfile, TokenResponse, Subscription, Purchases, Presentations, UserLogin
 from bson import ObjectId
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import timedelta, datetime
 from views import get_user_profile, verify_password, check_document_exists, create_access_token, create_refresh_token
 from typing import List
+from fastapi.middleware.cors import CORSMiddleware
+
 
 app = FastAPI(title="DeepChat")
 router = APIRouter()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @router.post("/register/", response_model=TokenResponse)
 async def register(user: UserProfile):
@@ -24,12 +32,16 @@ async def register(user: UserProfile):
 
     result = await db.user_profiles.insert_one(user_dict)
     user_profile = await get_user_profile(result.inserted_id)
-    access_token = create_access_token({"sub": user.username})
+
+    # Создаем access_token и refresh_token
+    access_token, access_token_expiration = create_access_token({"sub": user.username})
     refresh_token = create_refresh_token({"sub": user.username})
 
+    # Сохраняем refresh_token и access_token_expiration в MongoDB
     refresh_token_data = {
         "username": user.username,
         "refresh_token": refresh_token,
+        "access_token_expiration": access_token_expiration,
         "created_at": datetime.utcnow()
     }
 
@@ -41,11 +53,17 @@ async def register(user: UserProfile):
         )
     else:
         await db.refresh_tokens.insert_one(refresh_token_data)
-    return TokenResponse(access_token=access_token, refresh_token=refresh_token, token_type="bearer")
 
+    # Возвращаем ответ с токенами и сроком действия
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        access_token_expiration=access_token_expiration
+    )
 
 @router.post("/login/", response_model=TokenResponse)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login(form_data: UserLogin = Depends()):
     user = await db.user_profiles.find_one({"username": form_data.username})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -54,11 +72,16 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_profile = await get_user_profile(user["_id"])
-    access_token = create_access_token({"sub": form_data.username})
+
+    # Создаем access_token и refresh_token
+    access_token, access_token_expiration = create_access_token({"sub": form_data.username})
     refresh_token = create_refresh_token({"sub": form_data.username})
+
+    # Сохраняем refresh_token и access_token_expiration в MongoDB
     refresh_token_data = {
         "username": form_data.username,
         "refresh_token": refresh_token,
+        "access_token_expiration": access_token_expiration,  # Сохраняем срок действия
         "created_at": datetime.utcnow()
     }
 
@@ -71,7 +94,13 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     else:
         await db.refresh_tokens.insert_one(refresh_token_data)
 
-    return TokenResponse(access_token=access_token, refresh_token=refresh_token, token_type="bearer")
+    # Возвращаем ответ с токенами и сроком действия
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        access_token_expiration=access_token_expiration
+    )
 
 
 @router.post("/logout/")
@@ -94,7 +123,14 @@ async def refresh(refresh_token: str):
 
     if not token_data:
         raise HTTPException(status_code=404, detail="Invalid refresh token")
-    access_token = create_access_token({"sub": token_data.get("username")})
+    if token_data["access_token_expiration"] < datetime.utcnow():
+        raise HTTPException(status_code=401, detail="Access token has expired")
+    access_token, access_token_expiration = create_access_token({"sub": token_data.get("username")})
+    await db.refresh_tokens.update_one(
+        {"refresh_token": refresh_token},
+        {"$set": {"access_token_expiration": access_token_expiration}}
+    )
+
     return {"access_token": access_token, "token_type": "bearer"}
 
 
