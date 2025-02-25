@@ -1,14 +1,18 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Body
 from config import collections, db
 from database.models import UserProfile, TokenResponse, Subscription, Purchases, Presentations, UserLogin
 from bson import ObjectId
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import timedelta, datetime
-from views import get_user_profile, verify_password, check_document_exists, create_access_token, create_refresh_token
+from views import get_user_profile, verify_password, check_document_exists, create_access_token, create_refresh_token, \
+    get_current_user
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
-
+import uvicorn
+from fastapi import WebSocket, WebSocketDisconnect
+import httpx
+import json
 
 app = FastAPI(title="DeepChat")
 router = APIRouter()
@@ -19,6 +23,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @router.post("/register/", response_model=TokenResponse)
 async def register(user: UserProfile):
@@ -62,13 +67,14 @@ async def register(user: UserProfile):
         access_token_expiration=access_token_expiration
     )
 
+
 @router.post("/login/", response_model=TokenResponse)
-async def login(form_data: UserLogin = Depends()):
+async def login(form_data: UserLogin):
     user = await db.user_profiles.find_one({"username": form_data.username})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    if not user.get("password") or not verify_password(form_data.password, user["password"]):
+    if not user.get("password") or not await verify_password(form_data.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_profile = await get_user_profile(user["_id"])
@@ -132,6 +138,27 @@ async def refresh(refresh_token: str):
     )
 
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.get("/user-profiles/", response_model=List[UserProfile])
+async def list_user_profiles(current_user: dict = Depends(get_current_user)):
+    # Фильтруем профили по ID текущего пользователя
+    user_profiles = await db.user_profiles.find({"_id": ObjectId(current_user["_id"])}).to_list(100)
+    return [UserProfile(**profile) for profile in user_profiles]
+
+
+# @app.get("/user-profiles/", response_model=List[UserProfile])
+# async def list_user_profiles():
+#     user_profiles = await db.user_profiles.find().to_list()
+#     return user_profiles
+
+
+@router.get("/user-profile/{user_id}", response_model=UserProfile)
+async def read_user_profile(user_id: str):
+    user_profiles = await db.user_profiles.find_one({"_id": ObjectId(user_id)})
+    if user_profiles:
+        return user_profiles
+    raise HTTPException(status_code=404, detail="User not found")
 
 
 # CRUD for Presentations
@@ -263,10 +290,45 @@ async def delete_subscription(subscription_id: str):
     if delete_result.deleted_count:
         return {"message": "Subscription deleted"}
     raise HTTPException(status_code=404, detail="Subscription not found")
+
+
+@router.websocket("/ws/chat/")
+async def websocket_chat(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            user_message = await websocket.receive_text()
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        "https://7030-217-29-24-178.ngrok-free.app/v1/chat/completions",
+                        headers={"Content-Type": "application/json"},
+                        json={
+                            "model": "Qwen/Qwen2.5-3B-Instruct",
+                            "messages": [{"role": "user", "content": user_message}],
+                            "stream": True
+                        },
+                        timeout=10.0
+                    )
+
+                    if response.status_code != 200:
+                        await websocket.send_text("Ваш LLM не работает")
+                        continue
+
+                    async for chunk in response.aiter_text():
+                        await websocket.send_text(chunk)
+
+            except httpx.RequestError:
+                await websocket.send_text("Ваш LLM не работает")
+            except Exception as e:
+                await websocket.send_text(f"Произошла ошибка: {str(e)}")
+
+    except WebSocketDisconnect:
+        await websocket.close()
+
 app.include_router(router)
 
 
-
-
-
-
+if __name__ == '__main__':
+    uvicorn.run(app, host='127.0.0.1', port=8080)
