@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Body
+
+from auth import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from config import collections, db
-from database.models import UserProfile, TokenResponse, Subscription, Purchases, Presentations, UserLogin
+from database.models import UserProfile, TokenResponse, Subscription, Purchases, Presentations, UserLogin, \
+    RefreshTokenRequest, RefreshTokenResponse
 from bson import ObjectId
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import timedelta, datetime
@@ -14,16 +17,21 @@ from fastapi import WebSocket, WebSocketDisconnect
 import httpx
 import json
 
+
 app = FastAPI(title="DeepChat")
 router = APIRouter()
 
+origins = [
+    "http://localhost:3000"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=origins,  # Разрешенные домены
+    allow_credentials=True,
+    allow_methods=["*"],  # Разрешенные HTTP-методы (GET, POST, PUT и т.д.)
+    allow_headers=["*"],  # Разрешенные заголовки
 )
-
 
 @router.post("/register/", response_model=TokenResponse)
 async def register(user: UserProfile):
@@ -38,11 +46,9 @@ async def register(user: UserProfile):
     result = await db.user_profiles.insert_one(user_dict)
     user_profile = await get_user_profile(result.inserted_id)
 
-    # Создаем access_token и refresh_token
     access_token, access_token_expiration = create_access_token({"sub": user.username})
     refresh_token = create_refresh_token({"sub": user.username})
 
-    # Сохраняем refresh_token и access_token_expiration в MongoDB
     refresh_token_data = {
         "username": user.username,
         "refresh_token": refresh_token,
@@ -59,11 +65,9 @@ async def register(user: UserProfile):
     else:
         await db.refresh_tokens.insert_one(refresh_token_data)
 
-    # Возвращаем ответ с токенами и сроком действия
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        token_type="bearer",
         access_token_expiration=access_token_expiration
     )
 
@@ -79,11 +83,9 @@ async def login(form_data: UserLogin):
 
     user_profile = await get_user_profile(user["_id"])
 
-    # Создаем access_token и refresh_token
     access_token, access_token_expiration = create_access_token({"sub": form_data.username})
     refresh_token = create_refresh_token({"sub": form_data.username})
 
-    # Сохраняем refresh_token и access_token_expiration в MongoDB
     refresh_token_data = {
         "username": form_data.username,
         "refresh_token": refresh_token,
@@ -100,11 +102,9 @@ async def login(form_data: UserLogin):
     else:
         await db.refresh_tokens.insert_one(refresh_token_data)
 
-    # Возвращаем ответ с токенами и сроком действия
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        token_type="bearer",
         access_token_expiration=access_token_expiration
     )
 
@@ -123,34 +123,44 @@ async def logout(refresh_token: str):
     return {"detail": "Successfully logged out"}
 
 
-@router.post("/refresh/")
-async def refresh(refresh_token: str):
+@router.post("/refresh/", response_model=TokenResponse)
+async def refresh(request: RefreshTokenRequest):
+    refresh_token = request.refresh_token
     token_data = await db.refresh_tokens.find_one({"refresh_token": refresh_token})
-
     if not token_data:
         raise HTTPException(status_code=404, detail="Invalid refresh token")
     if token_data["access_token_expiration"] < datetime.utcnow():
         raise HTTPException(status_code=401, detail="Access token has expired")
-    access_token, access_token_expiration = create_access_token({"sub": token_data.get("username")})
+
+    username = token_data.get("username")
+    access_token, access_token_expiration = create_access_token({"sub": username})
+    new_refresh_token = create_refresh_token({"sub": username})
+
     await db.refresh_tokens.update_one(
         {"refresh_token": refresh_token},
-        {"$set": {"access_token_expiration": access_token_expiration}}
+        {"$set": {
+            "refresh_token": new_refresh_token,
+            "access_token_expiration": access_token_expiration
+        }}
     )
 
-    return {"access_token": access_token, "token_type": "bearer"}
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+        access_token_expiration=access_token_expiration
+    )
 
 
-@router.get("/user-profiles/", response_model=List[UserProfile])
-async def list_user_profiles(current_user: dict = Depends(get_current_user)):
-    # Фильтруем профили по ID текущего пользователя
+@router.get("/user/", response_model=List[UserProfile])
+async def list_user(current_user: dict = Depends(get_current_user)):
     user_profiles = await db.user_profiles.find({"_id": ObjectId(current_user["_id"])}).to_list(100)
     return [UserProfile(**profile) for profile in user_profiles]
 
 
-# @app.get("/user-profiles/", response_model=List[UserProfile])
-# async def list_user_profiles():
-#     user_profiles = await db.user_profiles.find().to_list()
-#     return user_profiles
+@router.get("/user-profiles/", response_model=List[UserProfile])
+async def list_user_profiles():
+    user_profiles = await db.user_profiles.find().to_list()
+    return user_profiles
 
 
 @router.get("/user-profile/{user_id}", response_model=UserProfile)
@@ -302,7 +312,7 @@ async def websocket_chat(websocket: WebSocket):
             try:
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
-                        "https://7030-217-29-24-178.ngrok-free.app/v1/chat/completions",
+                        "https://e067-92-62-70-2.ngrok-free.app/v1/chat/completions",
                         headers={"Content-Type": "application/json"},
                         json={
                             "model": "Qwen/Qwen2.5-3B-Instruct",
@@ -329,6 +339,3 @@ async def websocket_chat(websocket: WebSocket):
 
 app.include_router(router)
 
-
-if __name__ == '__main__':
-    uvicorn.run(app, host='127.0.0.1', port=8080)
