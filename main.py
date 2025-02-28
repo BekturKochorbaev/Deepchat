@@ -1,15 +1,15 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Body
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Body, Request
 
 from auth import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from config import collections, db
 from database.models import UserProfile, TokenResponse, Subscription, Purchases, Presentations, UserLogin, \
-    RefreshTokenRequest, RefreshTokenResponse
+    RefreshTokenRequest, RefreshTokenResponse, SlideRequest
 from bson import ObjectId
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import timedelta, datetime
 from views import get_user_profile, verify_password, check_document_exists, create_access_token, create_refresh_token, \
-    get_current_user
+    get_current_user, generate_second_slide, generate_first_slide
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -302,40 +302,148 @@ async def delete_subscription(subscription_id: str):
     raise HTTPException(status_code=404, detail="Subscription not found")
 
 
-@router.websocket("/ws/chat/")
+@app.websocket("/ws/chat/")
 async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
+            # Получаем сообщение от пользователя
             user_message = await websocket.receive_text()
 
             try:
+                # Формируем запрос к API AI (stream: False)
+                payload = {
+                    "model": "models/Qwen/Qwen2.5-3B-Instruct",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": user_message}
+                    ],
+                    "max_tokens": 2048,
+                    "stream": False  # Отключаем потоковую передачу
+                }
+
+                # Отправляем запрос в API AI
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
-                        "https://e067-92-62-70-2.ngrok-free.app/v1/chat/completions",
+                        "https://051e-92-62-70-2.ngrok-free.app/v1/chat/completions",
                         headers={"Content-Type": "application/json"},
-                        json={
-                            "model": "Qwen/Qwen2.5-3B-Instruct",
-                            "messages": [{"role": "user", "content": user_message}],
-                            "stream": True
-                        },
-                        timeout=10.0
+                        json=payload,
+                        timeout=10.0  # Таймаут для запроса
                     )
 
+                    # Проверяем статус ответа
                     if response.status_code != 200:
                         await websocket.send_text("Ваш LLM не работает")
                         continue
 
-                    async for chunk in response.aiter_text():
-                        await websocket.send_text(chunk)
+                    # Парсим ответ от API AI
+                    response_data = response.json()
+                    if "choices" in response_data and len(response_data["choices"]) > 0:
+                        # Извлекаем полный ответ
+                        full_response = response_data["choices"][0]["message"]["content"]
+                        await websocket.send_text(full_response)
+                    else:
+                        await websocket.send_text("Некорректный формат ответа от AI")
 
             except httpx.RequestError:
+                # Если API недоступен (например, нет сети или сервер упал)
                 await websocket.send_text("Ваш LLM не работает")
             except Exception as e:
+                # Ловим другие ошибки (например, проблемы с JSON)
                 await websocket.send_text(f"Произошла ошибка: {str(e)}")
 
     except WebSocketDisconnect:
+        # Обработка отключения пользователя
         await websocket.close()
 
+
+@router.post("/generate-slide/", operation_id="generate_slide")
+async def generate_slide(request: Request, slide_request: SlideRequest):
+    try:
+        body = await request.json()
+        print("Received request with body:", body)  # Логируем входящие данные
+    except Exception as e:
+        print("Failed to parse JSON body:", str(e))
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    keyword = slide_request.keyword
+    count = slide_request.count
+
+    if count not in [1, 2]:
+        raise HTTPException(status_code=400, detail="Количество слайдов должно быть 1 или 2")
+
+    # Генерация данных для слайда (заглушка)
+    first_slide_data = {
+        "keyword": keyword,
+        "title": f"Title for {keyword}",
+        "description": f"Description for {keyword}",
+        "image_url": "https://example.com/image.jpg",
+        "created_at": datetime.now()
+    }
+
+    # Сохраняем слайд в MongoDB (заглушка)
+    first_slide = await collections.insert_one(first_slide_data)
+    first_slide_id = str(first_slide.inserted_id)  # Преобразуем ObjectId в строку
+
+    response_data = {
+        "first_slide": {**first_slide_data, "id": first_slide_id}
+    }
+
+    if count == 2:
+        # Генерация данных для второго слайда (заглушка)
+        second_slide_data = {
+            "keyword": keyword,
+            "title": f"Second Title for {keyword}",
+            "description": f"Second Description for {keyword}",
+            "image_url": "https://example.com/image2.jpg",
+            "created_at": datetime.now()
+        }
+
+        # Сохраняем второй слайд в MongoDB (заглушка)
+        second_slide = await collections.insert_one(second_slide_data)
+        second_slide_id = str(second_slide.inserted_id)  # Преобразуем ObjectId в строку
+
+        response_data["second_slide"] = {**second_slide_data, "id": second_slide_id}
+
+    return response_data
+
+# Эндпоинт для получения всех слайдов
+@router.get("/get-slides/", operation_id="get_slides")
+async def get_slides():
+    slides = []
+    async for slide in collections.find():
+        slide["_id"] = str(slide["_id"])  # Преобразуем ObjectId в строку
+        slides.append(slide)
+    return {"slides": slides}
+
+
+
+@router.get("/get-slide/")
+async def get_slide(keyword: str, count: int = 1):
+    if count not in [1, 2]:
+        raise HTTPException(status_code=400, detail="Количество слайдов должно быть 1 или 2")
+
+    # Получаем первый слайд
+    first_slide = await collections.find_one({"keyword": keyword})
+    if not first_slide:
+        raise HTTPException(status_code=404, detail="Слайды не найдены")
+
+    response_data = {
+        "first_slide": {**first_slide, "id": str(first_slide["_id"])}
+    }
+
+    if count == 2:
+        # Получаем второй слайд по ключевому слову
+        second_slide = await collections.find_one({"keyword": keyword, "_id": {"$ne": first_slide["_id"]}})
+        if not second_slide:
+            raise HTTPException(status_code=404, detail="Второй слайд не найден")
+
+        response_data["second_slide"] = {**second_slide, "id": str(second_slide["_id"])}
+
+    return response_data
+
 app.include_router(router)
+
+
+
 

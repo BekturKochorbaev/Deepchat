@@ -5,6 +5,7 @@ from bson import ObjectId
 from passlib.context import CryptContext
 from passlib.hash import bcrypt
 from enum import Enum as PyEnum
+from typing import Optional
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -39,6 +40,7 @@ class TokenResponse(BaseModel):
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
+
 class RefreshTokenResponse(BaseModel):
     access_token: str
     refresh_token: str
@@ -72,3 +74,47 @@ class Subscription(BaseModel):
     start_date: datetime
     end_date: datetime
     status: StatusChoices
+
+
+class SlideBase(BaseModel):
+    keyword: str
+    title: str
+    description: Optional[str] = None
+    image_url: str
+    created_at: datetime = datetime.now()
+
+    class Config:
+        json_encoders = {
+            ObjectId: str
+        }
+
+
+class FirstSlide(SlideBase):
+    pass
+
+
+
+class SecondSlide(SlideBase):
+    subtitle_1: Optional[str] = None
+    description_1: Optional[str] = None
+    subtitle_2: Optional[str] = None
+    description_2: Optional[str] = None
+    subtitle_3: Optional[str] = None
+    description_3: Optional[str] = None
+    subtitle_4: Optional[str] = None
+    description_4: Optional[str] = None
+
+    class Config:
+        json_encoders = {
+            ObjectId: str
+        }
+
+
+class SlideRequest(BaseModel):
+    keyword: str
+    count: int = 1
+
+    class Config:
+        json_encoders = {
+            ObjectId: str
+        }
